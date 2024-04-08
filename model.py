@@ -89,6 +89,7 @@ class MultiHeadAttentionBlock(nn.Module):
         self.d_model = d_model
         assert self.d_model % self.h == 0, "Embedding dimension is not divisble by the number of heads."
 
+        self.d_k = self.d_model // self.h
         self.w_q = nn.Linear(self.d_model, self.d_model)
         self.w_k = nn.Linear(self.d_model, self.d_model)
         self.w_v = nn.Linear(self.d_model, self.d_model)
@@ -121,12 +122,13 @@ class MultiHeadAttentionBlock(nn.Module):
 
 
 
-    def forward(self, q, k, v, mask):
+    # Be careful with the order
+    def forward(self, q, k, v, mask): # Used for both the encoder and the decoder
         '''
         q, k, v are having the size of [batch, seq_len, d_model].
         need to turn them into [batch, h, seq_len, d_k] by turning them into [batch, seq_len, h, d_k] first. 
         '''
-        self.d_k = self.d_model // self.h
+        
         query = self.w_q(q).view(q.shape[0], q.shape[1], self.h, self.d_k).transpose(1, 2) # [batch, h, seq_len, d_k]
         key = self.w_k(k).view(k.shape[0], k.shape[1], self.h, self.d_k).transpose(1, 2)  # [batch, h, seq_len, d_k]
         value = self.w_v(v).view(v.shape[0], v.shape[1], self.h, self.d_k).transpose(1, 2)  # [batch, h, seq_len, d_k]
@@ -139,3 +141,122 @@ class MultiHeadAttentionBlock(nn.Module):
 
 
         return x # [batch, seq_len, d_model]
+
+
+class ResidualConnection(nn.Module):
+
+    def __init__(self, dropout: float) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        self.norm = LayerNormalization()
+        # sublayer?
+    
+    def forward(self, x, sublayer):
+        # sublayer here is a function
+        return x + self.dropout(sublayer(x.norm(x))) # we could also sublayer first and then norm it; sublayer could be the Feed Forward layer or the attention layer
+        # PAPER VERSION:
+        # return self.norm(x + self.dropout(sublayer(x))) 
+        # what if the function needs multiple input such as MultiHeadAttentionBlock? q, k, v and mask? - use lambda, which only takes 1 argument as input x 
+    
+
+
+class EncoderBlock(nn.Module):
+    """
+    Two residual connections: one for multi-head attention, the other for feed forward 
+    A src_mask is also needed in order to avoid the attention between words and padding words
+    """
+
+    # def __init__(self, N: int, d_model: int, d_ff: int, h: int, dropout:float):
+    #     super().__init__()
+    #     self.N = N
+    #     self.attentionResidual = ResidualConnection(dropout)
+    #     self.feedForwardResidual = ResidualConnection(dropout)
+    #     # form their sublayers respectively 
+    #     self.attentionSublayer = MultiHeadAttentionBlock(d_model, h, dropout)
+    #     self.feedForwardSublayer = FeedForwardBlock(d_model, d_ff, dropout)
+    
+    # def forward(self, x):
+    #     for i in range(self.N):
+    #         x = self.attentionResidual(x, self.attentionSublayer) # self.attentionSublayer(x, x, x, mask)
+    #         x = self.feedForwardResidual(x, self.feedForwardSublayer)
+    #     return x 
+
+    def __init__(self, self_attention_block: MultiHeadAttentionBlock, feed_forward_block: FeedForwardBlock, dropout: float):
+        super().__init__()
+        self.self_attention_block = self_attention_block
+        self.feed_forward_block = feed_forward_block
+        self.residualConnections = nn.ModuleList([ResidualConnection(dropout) for _ in range(2)])
+
+    def forward(self, x, src_mask): # avoid interactions with padding words 
+        x = self.residualConnections[0](x, lambda x: self.self_attention_block(x, x, x, src_mask))
+        x = self.residualConnections[1](x, self.feed_forward_block)
+        return x 
+    
+
+
+class Encoder(nn.Module):
+
+    """
+    At the end of the N times for loop, normalize the output
+    """
+
+    def __init__(self, blocks: nn.ModuleList):
+        super().__init__()
+        self.encoderBlocks = blocks 
+        self.norm = LayerNormalization()
+    
+    def forward(self, x, src_mask):
+        for block in self.encoderBlocks:
+            x = block(x, src_mask)
+        return self.norm(x)
+
+
+class DecoderBlock(nn.Module):
+
+    def __init__(self, self_attention_block: MultiHeadAttentionBlock, cross_attention_block: MultiHeadAttentionBlock, feed_forward_block: FeedForwardBlock, dropout: float):
+        super().__init__()
+        self.self_attention_block = self_attention_block
+        self.cross_attention_block = cross_attention_block
+        self.residualConnections = nn.ModuleList([ResidualConnection(dropout) for _ in range(3)])
+
+    def forward(self, x, encoder_output, encoder_mask, decoder_mask):
+        x = self.residualConnections[0](x, lambda x: self.self_attention_block(x, x, x, decoder_mask))
+        x = self.residualConnections[1](x, lambda x: self.cross_attention_block(x, encoder_output, encoder_output, encoder_mask))
+        x = self.residualConnections[2](x, self.feed_forward_block)
+        return x 
+
+
+class Decoder(nn.Module):
+
+    def __init__(self, blocks: nn.ModuleList):
+        super().__init__()
+        self.decoderBlocks = blocks 
+        self.norm = LayerNormalization()
+
+    def forward(self, x, encoder_output, encoder_mask, decoder_mask):
+        for block in self.decoderBlocks:
+            x = block(x, encoder_output, encoder_mask, decoder_mask)
+        return self.norm(x)
+
+
+class ProjectLayer(nn.Module):
+    
+    def __init__(self, d_model: int, vocab_size:int):
+        super().__init__()
+        self.linear = nn.Linear(d_model, vocab_size)
+    
+    def forward(self, x):
+        """
+        [batch, seq_len, d_model] --> [batch, seq_len, vocab_size], with log softmax post-processing
+        """
+        return torch.log_softmax(self.linear(x), dim=-1)
+
+
+
+
+
+
+
+
+
+
